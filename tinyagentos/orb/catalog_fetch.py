@@ -1,5 +1,6 @@
 """Orb catalog fetch + cached re-verify (spec s10)."""
 import asyncio
+import threading
 from pathlib import Path
 
 import httpx
@@ -18,6 +19,7 @@ from tinyagentos.orb.catalog_sig import (
 
 CATALOG_MAX_BYTES = 1 << 20
 SIG_MAX_BYTES = 256
+_ACCEPT_AND_CACHE_LOCK = threading.Lock()
 
 
 async def _get_capped(client, url: str, cap: int) -> bytes | None:
@@ -71,20 +73,21 @@ async def fetch_catalog(base_url: str, cache_dir, state_path, keys=None, timeout
 def _accept_and_cache(catalog_bytes, sig_bytes, state_path, keys, cache_dir):
     # Refuse a replayed non-firmware document before it can move the serial
     # or touch the cache.
-    doc = verify_catalog(catalog_bytes, sig_bytes, keys)
-    catalog.check_firmware_kind(doc)
+    with _ACCEPT_AND_CACHE_LOCK:
+        doc = verify_catalog(catalog_bytes, sig_bytes, keys)
+        catalog.check_firmware_kind(doc)
 
-    # accept_catalog records the serial before the cache is written. If the
-    # write then fails, state is ahead of the cache and load_cached_catalog
-    # refuses the older cache as a regression: fails closed, refetch recovers.
-    accept_catalog(catalog_bytes, sig_bytes, state_path, keys)
+        # accept_catalog records the serial before the cache is written. If the
+        # write then fails, state is ahead of the cache and load_cached_catalog
+        # refuses the older cache as a regression: fails closed, refetch recovers.
+        accept_catalog(catalog_bytes, sig_bytes, state_path, keys)
 
-    cache_dir_path = Path(cache_dir)
-    cache_dir_path.mkdir(parents=True, exist_ok=True)
-    atomic_io.atomic_write_bytes(cache_dir_path / "catalog.json", catalog_bytes)
-    atomic_io.atomic_write_bytes(cache_dir_path / "catalog.json.sig", sig_bytes if sig_bytes is not None else b"")
+        cache_dir_path = Path(cache_dir)
+        cache_dir_path.mkdir(parents=True, exist_ok=True)
+        atomic_io.atomic_write_bytes(cache_dir_path / "catalog.json", catalog_bytes)
+        atomic_io.atomic_write_bytes(cache_dir_path / "catalog.json.sig", sig_bytes if sig_bytes is not None else b"")
 
-    return catalog.load_catalog(str(cache_dir_path / "catalog.json"))
+        return catalog.load_catalog(str(cache_dir_path / "catalog.json"))
 
 
 def load_cached_catalog(cache_dir, state_path, keys=None):

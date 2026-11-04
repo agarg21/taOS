@@ -1,7 +1,10 @@
 """Tests for tinyagentos/orb/catalog_fetch."""
 import base64
+import gzip
 import hashlib
 import json
+import threading
+import time
 import pytest
 from pathlib import Path
 
@@ -409,13 +412,14 @@ async def test_compressed_response_rejected_before_reading_body(tmp_path, test_k
     catalog = {"serial": 1, "apps": [{"id": "app1", "name": "App1", "versions": []}]}
     catalog_bytes = json.dumps(catalog).encode("utf-8")
     sig_bytes = sign_catalog(private_key, catalog_bytes)
+    compressed_catalog = gzip.compress(catalog_bytes)
 
     cache_dir = tmp_path / "cache"
     state_path = tmp_path / "state.json"
 
     def handler(request: httpx.Request):
         if request.url.path.endswith("/catalog.json"):
-            return httpx.Response(200, content=catalog_bytes,
+            return httpx.Response(200, content=compressed_catalog,
                                   headers={"Content-Encoding": "gzip"})
         if request.url.path.endswith("/catalog.json.sig"):
             return httpx.Response(200, content=sig_bytes)
@@ -424,7 +428,7 @@ async def test_compressed_response_rejected_before_reading_body(tmp_path, test_k
     transport = httpx.MockTransport(handler)
     from tinyagentos.orb import catalog_fetch
 
-    with pytest.raises(CatalogFetchError):
+    with pytest.raises(CatalogFetchError) as exc_info:
         await catalog_fetch.fetch_catalog(
             "https://example.com/",
             cache_dir,
@@ -432,6 +436,7 @@ async def test_compressed_response_rejected_before_reading_body(tmp_path, test_k
             keys=keys_dict,
             transport=transport,
         )
+    assert 'compressed response' in str(exc_info.value)
     assert not (cache_dir / "catalog.json").exists()
     assert not (cache_dir / "catalog.json.sig").exists()
 
@@ -622,21 +627,88 @@ def test_load_cached_catalog_desktop_kind_rejected(tmp_path, test_key, keys_dict
     assert '"serial": 8' in state_text
 
 
-def test_accept_and_cache_refuses_desktop_kind_before_any_work(tmp_path, test_key, keys_dict):
-    """_accept_and_cache must refuse a non-firmware kind before it records the
-    serial or writes the cache; load_catalog's own check runs only after both."""
+@pytest.mark.asyncio
+async def test_fetch_catalog_file_io_runs_in_thread(tmp_path, test_key, keys_dict, monkeypatch):
+    """accept_catalog and the cache writes run off the event loop via
+    asyncio.to_thread."""
+    import threading
+    from tinyagentos import atomic_io
+    from tinyagentos.orb import catalog_fetch
+
     private_key, _, _ = test_key
-    catalog = {"serial": 5, "kind": "orb-desktop-apps", "apps": []}
+    catalog = {"serial": 1, "apps": [{"id": "app1"}]}
     catalog_bytes = json.dumps(catalog).encode("utf-8")
     sig_bytes = sign_catalog(private_key, catalog_bytes)
 
     cache_dir = tmp_path / "cache"
     state_path = tmp_path / "state.json"
+    main_tid = threading.get_ident()
+
+    def handler(request: httpx.Request):
+        if request.url.path.endswith("/catalog.json.sig"):
+            return httpx.Response(200, content=sig_bytes)
+        if request.url.path.endswith("/catalog.json"):
+            return httpx.Response(200, content=catalog_bytes)
+        return httpx.Response(404)
+
+    seen = set()
+
+    orig_atomic = atomic_io.atomic_write_bytes
+
+    def wrapped_atomic(path, data, mode=None):
+        seen.add(threading.get_ident())
+        return orig_atomic(path, data, mode=mode)
+
+    monkeypatch.setattr(atomic_io, "atomic_write_bytes", wrapped_atomic)
+    transport = httpx.MockTransport(handler)
+    result = await catalog_fetch.fetch_catalog(
+        "https://example.com", cache_dir, state_path, keys=keys_dict, transport=transport
+    )
+    assert "app1" in result.apps
+    assert seen
+    assert main_tid not in seen
+
+
+@pytest.mark.asyncio
+async def test_accept_and_cache_serialized_against_concurrent_writes(tmp_path, test_key, keys_dict, monkeypatch):
+    from tinyagentos import atomic_io
     from tinyagentos.orb import catalog_fetch
 
-    with pytest.raises(OrbError) as exc:
-        catalog_fetch._accept_and_cache(catalog_bytes, sig_bytes, state_path, keys_dict, cache_dir)
-    assert "orb-desktop-apps" in str(exc.value)
-    assert not state_path.exists()
-    assert not (cache_dir / "catalog.json").exists()
-    assert not (cache_dir / "catalog.json.sig").exists()
+    private_key, _, _ = test_key
+    catalog1 = {"serial": 1, "apps": [{"id": "app1"}]}
+    catalog2 = {"serial": 2, "apps": [{"id": "app2"}]}
+    catalog1_bytes = json.dumps(catalog1).encode("utf-8")
+    catalog2_bytes = json.dumps(catalog2).encode("utf-8")
+    sig1_bytes = sign_catalog(private_key, catalog1_bytes)
+    sig2_bytes = sign_catalog(private_key, catalog2_bytes)
+
+    cache_dir = tmp_path / "cache"
+    state_path = tmp_path / "state.json"
+
+    orig_atomic = atomic_io.atomic_write_bytes
+    call_count = {"n": 0}
+
+    def wrapped_atomic(path, data, mode=None):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            time.sleep(0.05)
+        return orig_atomic(path, data, mode=mode)
+
+    monkeypatch.setattr(atomic_io, "atomic_write_bytes", wrapped_atomic)
+
+    results = []
+
+    def run(serial_bytes, sig_bytes):
+        res = catalog_fetch._accept_and_cache(serial_bytes, sig_bytes, state_path, keys_dict, cache_dir)
+        results.append(res)
+
+    t1 = threading.Thread(target=run, args=(catalog1_bytes, sig1_bytes))
+    t2 = threading.Thread(target=run, args=(catalog2_bytes, sig2_bytes))
+    t1.start()
+    time.sleep(0.01)
+    t2.start()
+    t1.join()
+    t2.join()
+
+    assert (cache_dir / "catalog.json").read_bytes() == catalog2_bytes
+    catalog_fetch.load_cached_catalog(cache_dir, state_path, keys_dict)
