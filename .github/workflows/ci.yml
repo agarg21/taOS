@@ -137,7 +137,7 @@ jobs:
         # -n auto still uses both cores inside each shard.
         run: >-
           uv run --no-sync pytest tests/ --tb=short --ignore=tests/e2e
-          -n auto --splits 4 --group ${{ matrix.shard }}
+          -n logical --splits 4 --group ${{ matrix.shard }}
 
       # Import smoke check: identical in every shard, so run it once per Python
       # version (shard 1 only) rather than in all 4 shards.
